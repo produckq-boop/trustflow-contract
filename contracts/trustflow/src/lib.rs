@@ -53,10 +53,28 @@ const LEDGERS_PER_DAY: u32 = 17_280;
 // locked in before the commit window closes, and the reveal window only
 // opens once no further commitments are possible, so no juror can ever see
 // another's vote before their own is already fixed on-chain.
-// TODO: consider making these admin-configurable in a follow-up PR so the
-// commit/reveal windows can be tuned without a contract upgrade.
 const COMMIT_WINDOW_LEDGERS: u32 = LEDGERS_PER_DAY;
 const REVEAL_WINDOW_LEDGERS: u32 = LEDGERS_PER_DAY;
+
+/// Default total voting window for a dispute (commit + reveal phases), in
+/// ledgers. Configurable by the admin via [`TrustFlow::set_dispute_voting_window`].
+const DEFAULT_DISPUTE_VOTING_WINDOW: u32 = COMMIT_WINDOW_LEDGERS + REVEAL_WINDOW_LEDGERS;
+
+/// Minimum configurable dispute voting window (at least 1 ledger for commit
+/// and 1 ledger for reveal).
+const MIN_DISPUTE_VOTING_WINDOW: u32 = 2;
+
+/// Maximum configurable dispute voting window, bounded by a persistent entry's
+/// bumped TTL so a dispute cannot outlive its own storage lease without a bump.
+const MAX_DISPUTE_VOTING_WINDOW: u32 = PERSISTENT_BUMP_AMOUNT;
+
+/// Default minimum number of revealed votes required to resolve a dispute
+/// before `dispute_deadline` (and to apply minority slashing).
+const DEFAULT_DISPUTE_QUORUM: u32 = 2;
+
+/// Minimum configurable quorum. Must be at least 2 so a single colluding juror
+/// can never unilaterally resolve a dispute before the voting window closes.
+const MIN_DISPUTE_QUORUM: u32 = 2;
 
 /// Hashes a `(vote, salt)` pair into the commitment format used by
 /// `commit_vote`/`reveal_vote`: `sha256(vote_byte ++ salt)`.
@@ -231,12 +249,18 @@ pub enum TrustFlowError {
     /// The revealed `(vote, salt)` pair does not hash to the juror's stored
     /// commitment.
     InvalidReveal = 20,
-    /// `resolve_dispute` called before the reveal window has closed.
+    /// `resolve_dispute` called before `dispute_deadline` has passed without
+    /// reaching the minimum vote quorum (or while the commit phase is open).
     RevealPhaseNotEnded = 21,
     /// Returned when a sensitive contract entrypoint is called while the contract is paused.
     ContractPaused = 22,
     /// `release_milestone_tranche` called before the milestone's time-lock has expired.
     MilestoneTimeLocked = 23,
+    /// Admin attempted to set a dispute quorum below `MIN_DISPUTE_QUORUM`.
+    InvalidQuorum = 24,
+    /// Admin attempted to set a dispute voting window outside
+    /// `MIN_DISPUTE_VOTING_WINDOW..=MAX_DISPUTE_VOTING_WINDOW`.
+    InvalidVotingWindow = 25,
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +465,12 @@ pub enum DataKey {
     Paused,
     /// Granular role: address authorized to trigger emergency pause (Address)
     Pauser,
+    /// Global dispute voting window in ledgers (split into commit + reveal
+    /// phases), admin-configurable via `set_dispute_voting_window`.
+    DisputeVotingWindow,
+    /// Minimum revealed votes required to resolve a dispute before
+    /// `dispute_deadline` and to apply minority slashing (u32).
+    DisputeQuorum,
 }
 
 /// Helper function that returns `Err(TrustFlowError::ContractPaused)` if the
@@ -500,9 +530,12 @@ pub struct DisputeRecord {
     pub ruling_for_depositor: bool,
     /// Ledger sequence number after which `commit_vote` is rejected.
     pub commit_deadline: u32,
-    /// Ledger sequence number after which `reveal_vote` is rejected, and
-    /// before which `resolve_dispute` is rejected.
+    /// Ledger sequence number after which `reveal_vote` is rejected.
     pub reveal_deadline: u32,
+    /// Ledger sequence number marking the close of the dispute voting window.
+    /// `resolve_dispute` is rejected before `dispute_deadline` unless at least
+    /// `DisputeQuorum` votes have been revealed after `commit_deadline`.
+    pub dispute_deadline: u32,
 }
 
 /// Fee configuration snapshotted onto an escrow at creation time. Later
@@ -545,6 +578,13 @@ impl TrustFlow {
             .instance()
             .set(&DataKey::FeeBps, &DEFAULT_FEE_BPS);
         env.storage().instance().set(&DataKey::Treasury, &admin);
+        env.storage().instance().set(
+            &DataKey::DisputeVotingWindow,
+            &DEFAULT_DISPUTE_VOTING_WINDOW,
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeQuorum, &DEFAULT_DISPUTE_QUORUM);
         extend_instance_ttl(&env);
     }
 
@@ -592,6 +632,66 @@ impl TrustFlow {
         }
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         Ok(())
+    }
+
+    /// Admin-only: update the minimum number of revealed juror votes required
+    /// to resolve a dispute before `dispute_deadline` (and to apply slashing).
+    pub fn set_dispute_quorum(
+        env: Env,
+        caller: Address,
+        quorum: u32,
+    ) -> Result<(), TrustFlowError> {
+        caller.require_auth();
+        extend_instance_ttl(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            return Err(TrustFlowError::Unauthorized);
+        }
+        if quorum < MIN_DISPUTE_QUORUM {
+            return Err(TrustFlowError::InvalidQuorum);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeQuorum, &quorum);
+        Ok(())
+    }
+
+    /// Return the configured minimum dispute quorum.
+    pub fn get_dispute_quorum(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::DisputeQuorum)
+            .unwrap_or(DEFAULT_DISPUTE_QUORUM)
+    }
+
+    /// Admin-only: update the global dispute voting window (in ledgers) used
+    /// when new disputes are raised. Does not alter already-open disputes.
+    pub fn set_dispute_voting_window(
+        env: Env,
+        caller: Address,
+        ledgers: u32,
+    ) -> Result<(), TrustFlowError> {
+        caller.require_auth();
+        extend_instance_ttl(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            return Err(TrustFlowError::Unauthorized);
+        }
+        if !(MIN_DISPUTE_VOTING_WINDOW..=MAX_DISPUTE_VOTING_WINDOW).contains(&ledgers) {
+            return Err(TrustFlowError::InvalidVotingWindow);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeVotingWindow, &ledgers);
+        Ok(())
+    }
+
+    /// Return the configured dispute voting window, in ledgers.
+    pub fn get_dispute_voting_window(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::DisputeVotingWindow)
+            .unwrap_or(DEFAULT_DISPUTE_VOTING_WINDOW)
     }
 
     // -----------------------------------------------------------------------
@@ -1133,9 +1233,18 @@ impl TrustFlow {
         // Keep it alive whenever the escrow is refreshed on dispute entry.
         extend_persistent_ttl(&env, &DataKey::EscrowReleased(escrow_id));
 
+        let voting_window: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputeVotingWindow)
+            .unwrap_or(DEFAULT_DISPUTE_VOTING_WINDOW);
+        let commit_window = voting_window / 2;
+        let reveal_window = voting_window - commit_window;
+
         let now = env.ledger().sequence();
-        let commit_deadline = now.saturating_add(COMMIT_WINDOW_LEDGERS);
-        let reveal_deadline = commit_deadline.saturating_add(REVEAL_WINDOW_LEDGERS);
+        let commit_deadline = now.saturating_add(commit_window);
+        let reveal_deadline = commit_deadline.saturating_add(reveal_window);
+        let dispute_deadline = reveal_deadline;
 
         let dispute_key = DataKey::Dispute(escrow_id);
         env.storage().persistent().set(
@@ -1148,6 +1257,7 @@ impl TrustFlow {
                 ruling_for_depositor: false,
                 commit_deadline,
                 reveal_deadline,
+                dispute_deadline,
             },
         );
         extend_persistent_ttl(&env, &dispute_key);
@@ -1323,12 +1433,23 @@ impl TrustFlow {
         Ok(())
     }
 
-    /// Resolve a dispute by tallying juror votes.
+    /// Resolve a dispute by tallying revealed juror votes.
     ///
-    /// Jurors whose vote disagrees with the majority ruling are **slashed**:
-    /// `slash_bps / 10_000` of their current stake is burned from their
-    /// in-contract balance.  In the event of a tie the ruling favours the
-    /// depositor.
+    /// Enforces a **quorum-OR-deadline** gate once the commit phase closes:
+    /// - Before `commit_deadline`, resolution always reverts.
+    /// - Before `dispute_deadline`, at least `DisputeQuorum` revealed votes are
+    ///   required (`RevealPhaseNotEnded` otherwise), blocking single-juror
+    ///   early-resolution attacks while allowing early settlement once quorum
+    ///   has converged.
+    /// - At or after `dispute_deadline`, sub-quorum disputes with at least one
+    ///   revealed vote settle via fallback plurality tally (ties break in
+    ///   favour of the depositor) without slashing dissenting jurors, so escrow
+    ///   funds are never stranded by low turnout while jurors are not penalized
+    ///   on a thin sub-quorum sample. Zero revealed votes return `NoVotesCast`.
+    ///
+    /// When quorum is met, jurors whose vote disagrees with the majority ruling
+    /// are **slashed**: `slash_bps / 10_000` of their current stake is burned
+    /// from their in-contract balance.
     ///
     /// Returns `true` if the ruling is for the depositor, `false` otherwise.
     pub fn resolve_dispute(env: Env, escrow_id: u64) -> Result<bool, TrustFlowError> {
@@ -1343,15 +1464,23 @@ impl TrustFlow {
         if dispute.resolved {
             return Err(TrustFlowError::DisputeAlreadyResolved);
         }
-        if env.ledger().sequence() < dispute.reveal_deadline {
-            return Err(TrustFlowError::RevealPhaseNotEnded);
-        }
 
         let voters: Vec<Address> = env
             .storage()
             .persistent()
             .get(&DataKey::DisputeVoters(escrow_id))
             .unwrap_or_else(|| Vec::new(&env));
+        let quorum: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputeQuorum)
+            .unwrap_or(DEFAULT_DISPUTE_QUORUM);
+        let quorum_met = voters.len() >= quorum;
+
+        let now = env.ledger().sequence();
+        if now < dispute.commit_deadline || (now < dispute.dispute_deadline && !quorum_met) {
+            return Err(TrustFlowError::RevealPhaseNotEnded);
+        }
         if voters.is_empty() {
             return Err(TrustFlowError::NoVotesCast);
         }
@@ -1382,87 +1511,89 @@ impl TrustFlow {
         // Tie breaks in favour of the depositor
         let ruling = for_depositor >= for_beneficiary;
 
-        // Slash minority voters
-        let slash_bps: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::SlashBps)
-            .unwrap_or(DEFAULT_SLASH_BPS);
-
-        for voter in voters.iter() {
-            let vote: bool = env
+        // Slash minority voters only when the minimum quorum was reached.
+        if quorum_met {
+            let slash_bps: u32 = env
                 .storage()
-                .persistent()
-                .get(&DataKey::JurorVote(VoteKey {
-                    escrow_id,
-                    juror: voter.clone(),
-                }))
-                .unwrap_or(false);
+                .instance()
+                .get(&DataKey::SlashBps)
+                .unwrap_or(DEFAULT_SLASH_BPS);
 
-            if vote != ruling {
-                let stake_key = DataKey::JurorStake(voter.clone());
-                let stake: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0);
-                // slash_amount = stake * slash_bps / 10_000, capped at stake.
-                //
-                // Three-tier safe arithmetic:
-                //   1. Try i128 checked_mul (fast path, covers typical values).
-                //   2. Widen to u128 for stakes up to ~3.4e35 with bps up to
-                //      ~10_000 (covers virtually all realistic values).
-                //   3. If even u128 overflows, divide first then multiply —
-                //      this truncates early but guarantees no overflow for any
-                //      stake/bps combination that fits in i128.
-                let slash: i128 = {
-                    let stake_u128 = stake as u128;
-                    let bps_u128 = slash_bps as u128;
-                    let slash_u128 = stake
-                        .checked_mul(slash_bps as i128)
-                        .and_then(|v| v.checked_div(10_000))
-                        .map(|v| v as u128)
-                        .or_else(|| {
-                            // i128 overflow — try u128
-                            stake_u128
-                                .checked_mul(bps_u128)
-                                .and_then(|v| v.checked_div(10_000))
-                                .or_else(|| {
-                                    // u128 overflow too — divide first
-                                    stake_u128
-                                        .checked_div(10_000)
-                                        .map(|q| q.saturating_mul(bps_u128))
-                                })
-                        })
-                        .unwrap_or(stake_u128)
-                        .min(stake_u128);
-                    slash_u128 as i128
-                };
-
-                let remaining_stake = stake
-                    .checked_sub(slash)
-                    .ok_or(TrustFlowError::ArithmeticOverflow)?;
-                env.storage().persistent().set(&stake_key, &remaining_stake);
-                extend_persistent_ttl(&env, &stake_key);
-
-                let slash_count_key = DataKey::JurorSlashCount(voter.clone());
-                let count: u32 = env
+            for voter in voters.iter() {
+                let vote: bool = env
                     .storage()
                     .persistent()
-                    .get(&slash_count_key)
-                    .unwrap_or(0);
-                let new_count = count
-                    .checked_add(1)
-                    .ok_or(TrustFlowError::ArithmeticOverflow)?;
-                env.storage().persistent().set(&slash_count_key, &new_count);
-                extend_persistent_ttl(&env, &slash_count_key);
-
-                env.events().publish(
-                    (symbol_short!("slash"), symbol_short!("slashed")),
-                    JurorSlashed {
+                    .get(&DataKey::JurorVote(VoteKey {
                         escrow_id,
-                        juror: voter,
-                        slash_amount: slash,
-                        remaining_stake,
-                        slash_count: new_count,
-                    },
-                );
+                        juror: voter.clone(),
+                    }))
+                    .unwrap_or(false);
+
+                if vote != ruling {
+                    let stake_key = DataKey::JurorStake(voter.clone());
+                    let stake: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0);
+                    // slash_amount = stake * slash_bps / 10_000, capped at stake.
+                    //
+                    // Three-tier safe arithmetic:
+                    //   1. Try i128 checked_mul (fast path, covers typical values).
+                    //   2. Widen to u128 for stakes up to ~3.4e35 with bps up to
+                    //      ~10_000 (covers virtually all realistic values).
+                    //   3. If even u128 overflows, divide first then multiply —
+                    //      this truncates early but guarantees no overflow for any
+                    //      stake/bps combination that fits in i128.
+                    let slash: i128 = {
+                        let stake_u128 = stake as u128;
+                        let bps_u128 = slash_bps as u128;
+                        let slash_u128 = stake
+                            .checked_mul(slash_bps as i128)
+                            .and_then(|v| v.checked_div(10_000))
+                            .map(|v| v as u128)
+                            .or_else(|| {
+                                // i128 overflow — try u128
+                                stake_u128
+                                    .checked_mul(bps_u128)
+                                    .and_then(|v| v.checked_div(10_000))
+                                    .or_else(|| {
+                                        // u128 overflow too — divide first
+                                        stake_u128
+                                            .checked_div(10_000)
+                                            .map(|q| q.saturating_mul(bps_u128))
+                                    })
+                            })
+                            .unwrap_or(stake_u128)
+                            .min(stake_u128);
+                        slash_u128 as i128
+                    };
+
+                    let remaining_stake = stake
+                        .checked_sub(slash)
+                        .ok_or(TrustFlowError::ArithmeticOverflow)?;
+                    env.storage().persistent().set(&stake_key, &remaining_stake);
+                    extend_persistent_ttl(&env, &stake_key);
+
+                    let slash_count_key = DataKey::JurorSlashCount(voter.clone());
+                    let count: u32 = env
+                        .storage()
+                        .persistent()
+                        .get(&slash_count_key)
+                        .unwrap_or(0);
+                    let new_count = count
+                        .checked_add(1)
+                        .ok_or(TrustFlowError::ArithmeticOverflow)?;
+                    env.storage().persistent().set(&slash_count_key, &new_count);
+                    extend_persistent_ttl(&env, &slash_count_key);
+
+                    env.events().publish(
+                        (symbol_short!("slash"), symbol_short!("slashed")),
+                        JurorSlashed {
+                            escrow_id,
+                            juror: voter,
+                            slash_amount: slash,
+                            remaining_stake,
+                            slash_count: new_count,
+                        },
+                    );
+                }
             }
         }
 
@@ -1719,16 +1850,29 @@ mod tests {
         let malicious_commitment = hash_vote(env, false, &salt);
         client.commit_vote(&escrow_id, malicious_juror, &malicious_commitment);
 
+        let dispute = read_dispute(env, &client.address, escrow_id);
+
         // Move past the commit window into the reveal window.
-        advance_ledger(env, COMMIT_WINDOW_LEDGERS);
+        advance_ledger(
+            env,
+            dispute
+                .commit_deadline
+                .saturating_sub(env.ledger().sequence()),
+        );
 
         for j in honest_jurors {
             client.reveal_vote(&escrow_id, j, &true, &salt);
         }
         client.reveal_vote(&escrow_id, malicious_juror, &false, &salt);
 
-        // Move past the reveal window so `resolve_dispute` is callable.
-        advance_ledger(env, REVEAL_WINDOW_LEDGERS);
+        // Advance past `dispute_deadline` so `resolve_dispute` is callable
+        // regardless of the configured quorum.
+        advance_ledger(
+            env,
+            dispute
+                .dispute_deadline
+                .saturating_sub(env.ledger().sequence()),
+        );
 
         client.resolve_dispute(&escrow_id);
         escrow_id
@@ -3866,5 +4010,317 @@ mod tests {
         client.release_milestone_tranche(&escrow_id, &0u32, &50_000, &depositor);
 
         assert_eq!(balance(&env, &token_addr, &beneficiary), 49_750);
+    }
+
+    // -----------------------------------------------------------------------
+    // Dispute voting window & quorum tests (#58)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_raise_dispute_sets_dispute_deadline_and_snapshots_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let admin = client.get_treasury();
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+
+        mint(&sac, &depositor, 2_000);
+        advance_ledger(&env, 100);
+
+        let escrow_1 = client.create_escrow(&depositor, &beneficiary, &1_000);
+        client.raise_dispute(&escrow_1, &depositor, &String::from_slice(&env, "d1"));
+        let d1 = read_dispute(&env, &client.address, escrow_1);
+        assert_eq!(d1.commit_deadline, 100 + COMMIT_WINDOW_LEDGERS);
+        assert_eq!(d1.reveal_deadline, 100 + DEFAULT_DISPUTE_VOTING_WINDOW);
+        assert_eq!(d1.dispute_deadline, 100 + DEFAULT_DISPUTE_VOTING_WINDOW);
+
+        // Odd custom window (21 ledgers -> 10 commit + 11 reveal) applies to
+        // newly raised disputes without altering `escrow_1`'s deadline.
+        client.set_dispute_voting_window(&admin, &21);
+        assert_eq!(client.get_dispute_voting_window(), 21);
+
+        let escrow_2 = client.create_escrow(&depositor, &beneficiary, &1_000);
+        client.raise_dispute(&escrow_2, &depositor, &String::from_slice(&env, "d2"));
+        let d2 = read_dispute(&env, &client.address, escrow_2);
+        assert_eq!(d2.commit_deadline, 110);
+        assert_eq!(d2.reveal_deadline, 121);
+        assert_eq!(d2.dispute_deadline, 121);
+        assert_eq!(
+            read_dispute(&env, &client.address, escrow_1).dispute_deadline,
+            100 + DEFAULT_DISPUTE_VOTING_WINDOW
+        );
+    }
+
+    #[test]
+    fn test_resolve_dispute_single_vote_before_deadline_fails_and_cannot_steal_escrow() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let colluding_juror = Address::random(&env);
+        let honest_a = Address::random(&env);
+        let honest_b = Address::random(&env);
+
+        mint(&sac, &depositor, 1_000);
+        for j in [&colluding_juror, &honest_a, &honest_b] {
+            mint(&sac, j, 500);
+            client.stake(j, &500);
+        }
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &1_000);
+        client.raise_dispute(
+            &escrow_id,
+            &depositor,
+            &String::from_slice(&env, "early-resolve exploit attempt"),
+        );
+
+        let salt = test_salt(&env);
+        client.commit_vote(&escrow_id, &colluding_juror, &hash_vote(&env, false, &salt));
+        client.commit_vote(&escrow_id, &honest_a, &hash_vote(&env, true, &salt));
+        client.commit_vote(&escrow_id, &honest_b, &hash_vote(&env, true, &salt));
+
+        // Resolution during the commit phase must fail.
+        assert_eq!(
+            client.try_resolve_dispute(&escrow_id),
+            Err(Ok(TrustFlowError::RevealPhaseNotEnded))
+        );
+
+        // Enter reveal window: colluding juror reveals first and tries to
+        // immediately settle with 1 vote before honest jurors reveal.
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
+        client.reveal_vote(&escrow_id, &colluding_juror, &false, &salt);
+
+        assert_eq!(
+            client.try_resolve_dispute(&escrow_id),
+            Err(Ok(TrustFlowError::RevealPhaseNotEnded))
+        );
+        assert_eq!(
+            read_escrow(&env, &client.address, escrow_id).status,
+            EscrowStatus::Disputed
+        );
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 0);
+
+        // Honest jurors still get to reveal and overturn the colluding vote.
+        client.reveal_vote(&escrow_id, &honest_a, &true, &salt);
+        client.reveal_vote(&escrow_id, &honest_b, &true, &salt);
+
+        let ruling = client.resolve_dispute(&escrow_id);
+        assert!(ruling);
+        assert_eq!(balance(&env, &token_addr, &depositor), 1_000);
+        assert_eq!(client.get_slash_count(&colluding_juror), 1);
+    }
+
+    #[test]
+    fn test_resolve_dispute_after_quorum_reached_before_deadline_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let admin = client.get_treasury();
+        client.set_dispute_quorum(&admin, &3);
+
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let j1 = Address::random(&env);
+        let j2 = Address::random(&env);
+        let j3 = Address::random(&env);
+        let j4 = Address::random(&env);
+
+        mint(&sac, &depositor, 1_000);
+        for j in [&j1, &j2, &j3, &j4] {
+            mint(&sac, j, 500);
+            client.stake(j, &500);
+        }
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &1_000);
+        client.raise_dispute(
+            &escrow_id,
+            &depositor,
+            &String::from_slice(&env, "quorum before deadline"),
+        );
+
+        let salt = test_salt(&env);
+        client.commit_vote(&escrow_id, &j1, &hash_vote(&env, false, &salt));
+        client.commit_vote(&escrow_id, &j2, &hash_vote(&env, false, &salt));
+        client.commit_vote(&escrow_id, &j3, &hash_vote(&env, true, &salt));
+        client.commit_vote(&escrow_id, &j4, &hash_vote(&env, false, &salt));
+
+        // Advance into the reveal phase, still well before `dispute_deadline`.
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS + 10);
+        let dispute = read_dispute(&env, &client.address, escrow_id);
+        assert!(env.ledger().sequence() < dispute.dispute_deadline);
+
+        // Two votes (< quorum of 3) before deadline must still fail.
+        client.reveal_vote(&escrow_id, &j1, &false, &salt);
+        client.reveal_vote(&escrow_id, &j2, &false, &salt);
+        assert_eq!(
+            client.try_resolve_dispute(&escrow_id),
+            Err(Ok(TrustFlowError::RevealPhaseNotEnded))
+        );
+
+        // Third vote reaches quorum (3) before `dispute_deadline` -> resolves!
+        client.reveal_vote(&escrow_id, &j3, &true, &salt);
+        let ruling = client.resolve_dispute(&escrow_id);
+        assert!(!ruling, "2-to-1 majority should rule for beneficiary");
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 1_000);
+        assert_eq!(client.get_slash_count(&j3), 1);
+        assert_eq!(client.get_stake(&j3), 450);
+
+        // Late reveal after quorum resolution is cleanly rejected.
+        assert_eq!(
+            client.try_reveal_vote(&escrow_id, &j4, &false, &salt),
+            Err(Ok(TrustFlowError::DisputeAlreadyResolved))
+        );
+    }
+
+    #[test]
+    fn test_resolve_dispute_after_deadline_with_sub_quorum_votes_settles_without_slashing() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let admin = client.get_treasury();
+        client.set_dispute_quorum(&admin, &4);
+
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let juror_a = Address::random(&env);
+        let juror_b = Address::random(&env);
+
+        mint(&sac, &depositor, 1_000);
+        mint(&sac, &juror_a, 500);
+        mint(&sac, &juror_b, 500);
+        client.stake(&juror_a, &500);
+        client.stake(&juror_b, &500);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &1_000);
+        client.raise_dispute(
+            &escrow_id,
+            &depositor,
+            &String::from_slice(&env, "sub-quorum turnout"),
+        );
+
+        let salt = test_salt(&env);
+        client.commit_vote(&escrow_id, &juror_a, &hash_vote(&env, true, &salt));
+        client.commit_vote(&escrow_id, &juror_b, &hash_vote(&env, false, &salt));
+
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
+        client.reveal_vote(&escrow_id, &juror_a, &true, &salt);
+        client.reveal_vote(&escrow_id, &juror_b, &false, &salt);
+
+        // Before `dispute_deadline`, 2 votes < quorum (4) must revert.
+        assert_eq!(
+            client.try_resolve_dispute(&escrow_id),
+            Err(Ok(TrustFlowError::RevealPhaseNotEnded))
+        );
+
+        // Once `dispute_deadline` has passed, sub-quorum fallback settles the
+        // escrow (tie breaks for depositor) without slashing `juror_b`.
+        advance_ledger(&env, REVEAL_WINDOW_LEDGERS);
+        let ruling = client.resolve_dispute(&escrow_id);
+        assert!(ruling);
+        assert_eq!(balance(&env, &token_addr, &depositor), 1_000);
+        assert_eq!(
+            read_escrow(&env, &client.address, escrow_id).status,
+            EscrowStatus::Settled
+        );
+        assert_eq!(client.get_slash_count(&juror_a), 0);
+        assert_eq!(client.get_slash_count(&juror_b), 0);
+        assert_eq!(client.get_stake(&juror_b), 500);
+    }
+
+    #[test]
+    fn test_dispute_quorum_and_voting_window_admin_controls() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let admin = client.get_treasury();
+        let outsider = Address::random(&env);
+
+        assert_eq!(client.get_dispute_quorum(), DEFAULT_DISPUTE_QUORUM);
+        assert_eq!(
+            client.get_dispute_voting_window(),
+            DEFAULT_DISPUTE_VOTING_WINDOW
+        );
+
+        // Unauthorized callers are rejected.
+        assert_eq!(
+            client.try_set_dispute_quorum(&outsider, &3),
+            Err(Ok(TrustFlowError::Unauthorized))
+        );
+        assert_eq!(
+            client.try_set_dispute_voting_window(&outsider, &100),
+            Err(Ok(TrustFlowError::Unauthorized))
+        );
+
+        // Quorum < 2 is rejected so single-vote early resolution can never be re-enabled.
+        assert_eq!(
+            client.try_set_dispute_quorum(&admin, &0),
+            Err(Ok(TrustFlowError::InvalidQuorum))
+        );
+        assert_eq!(
+            client.try_set_dispute_quorum(&admin, &1),
+            Err(Ok(TrustFlowError::InvalidQuorum))
+        );
+
+        // Window outside MIN..=MAX is rejected.
+        assert_eq!(
+            client.try_set_dispute_voting_window(&admin, &0),
+            Err(Ok(TrustFlowError::InvalidVotingWindow))
+        );
+        assert_eq!(
+            client.try_set_dispute_voting_window(&admin, &1),
+            Err(Ok(TrustFlowError::InvalidVotingWindow))
+        );
+        assert_eq!(
+            client.try_set_dispute_voting_window(&admin, &(MAX_DISPUTE_VOTING_WINDOW + 1)),
+            Err(Ok(TrustFlowError::InvalidVotingWindow))
+        );
+
+        // Valid boundaries succeed, and `dispute_round` works with custom short window.
+        client.set_dispute_quorum(&admin, &MIN_DISPUTE_QUORUM);
+        client.set_dispute_voting_window(&admin, &MIN_DISPUTE_VOTING_WINDOW);
+        assert_eq!(client.get_dispute_quorum(), MIN_DISPUTE_QUORUM);
+        assert_eq!(
+            client.get_dispute_voting_window(),
+            MIN_DISPUTE_VOTING_WINDOW
+        );
+
+        let honest1 = Address::random(&env);
+        let honest2 = Address::random(&env);
+        let malicious = Address::random(&env);
+        for j in [&honest1, &honest2, &malicious] {
+            mint(&sac, j, 500);
+            client.stake(j, &500);
+        }
+        dispute_round(
+            &env,
+            &client,
+            &sac,
+            &_token_addr,
+            &[honest1, honest2],
+            &malicious,
+            DEFAULT_SLASH_BPS,
+        );
+        assert_eq!(client.get_slash_count(&malicious), 1);
+
+        client.set_dispute_voting_window(&admin, &MAX_DISPUTE_VOTING_WINDOW);
+        assert_eq!(
+            client.get_dispute_voting_window(),
+            MAX_DISPUTE_VOTING_WINDOW
+        );
+
+        // Read-only config queries remain callable while the contract is paused.
+        client.pause(&admin);
+        assert_eq!(client.get_dispute_quorum(), MIN_DISPUTE_QUORUM);
+        assert_eq!(
+            client.get_dispute_voting_window(),
+            MAX_DISPUTE_VOTING_WINDOW
+        );
     }
 }
